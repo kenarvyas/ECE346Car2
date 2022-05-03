@@ -25,6 +25,7 @@ class Track:
     if center_line is not None:
       self.center_line = Curve(x=center_line[0, :], y=center_line[1, :], k=3)
       self.length = self.center_line.getLength()
+      self.center_line_raw = center_line
     else:
       self.length = None
       self.center_line = None
@@ -67,8 +68,10 @@ class Track:
     '''
     s, _ = self.center_line.projectPoint(points.T, eps=1e-3)
 
+    delta = self.center_line_raw[:2, -1][:, np.newaxis] - points
+
     closest_pt, slope = self._interp_s(s)
-    return closest_pt, slope, s * self.length
+    return closest_pt, slope, delta
 
   def project_point(self, point):
     s, _ = self.center_line.projectPoint(point, eps=1e-3)
@@ -113,7 +116,7 @@ class Track:
       self.track_center = interp_pt
       print(len(slope))
 
-    plt.plot(self.track_center[0, :], self.track_center[1, :], 'r--')
+    plt.scatter(self.track_center[0, :], self.track_center[1, :], color='red')
 
   def load_from_file(self, filename):
     track_file = 'outerloop_center_smooth.csv'

@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 from pickle import FALSE
-from telnetlib import NOP
 import threading
 from collections import deque
 
@@ -13,13 +12,13 @@ from nav_msgs.msg import Odometry
 from apriltag_ros.msg import AprilTagDetectionArray
 from scipy.spatial.transform import Rotation
 from stanley_backup import Stanley
-#from ilqr_own import ILQR_Own
+from ilqr_own import ILQR_Own
 from rc_control_msgs.msg import RCControl
 import yaml, csv
 import time
 import matplotlib.pyplot as plt
 
-controller = "ilqr_old" # "ilqr_new, ilqr_old, or stanley"
+controller = "ilqr_new" # "ilqr_new, ilqr_old, or stanley"
 
 class State():
     def __init__(self, state, t) -> None:
@@ -81,18 +80,12 @@ class Planning_MPC():
 
         # set up the optimal control solver
         if controller=="ilqr_old":
-            randx, randy = [0,1,2,3,4,5,6], [0,1,2,3,4,5,6]
-            random_track =  Track(center_line=np.array([randx,randy]),
-                                width_left=self.params['track_width_L'],
-                                width_right=self.params['track_width_R'],
-                                loop=True)
-
-            self.ocp_solver = iLQR(params=self.params, ref_path=random_track)
+            self.ocp_solver = iLQR(params=self.params)
         elif controller=="stanley":
             gain = 1
             self.ocp_solver = Stanley(gain)
-        #elif controller=="ilqr_new":
-            #self.ocp_solver = ILRQ_Own()
+        elif controller=="ilqr_new":
+            self.ocp_solver = ILRQ_Own()
 
         rospy.loginfo("Successfully initialized the solver with horizon " +
                     str(self.T) + "s, and " + str(self.N) + " steps.")
@@ -103,7 +96,6 @@ class Planning_MPC():
         self.lead_car_center_line = None
         self.following_car_center_line = None
         self.lead_car_traj = None
-        self.lead_car_traj_raw = None
 
         self.i = 0
 
@@ -123,11 +115,9 @@ class Planning_MPC():
                                         self.lead_car_odom_sub_callback,
                                         queue_size=1)
         self.use_april = False
-
-        self.stopping = False
     
         # start planning thread
-        threading.Thread(target=self.ilqr_pub_thread).start()
+        # threading.Thread(target=self.ilqr_pub_thread).start()
     def april_tag_sub_callback(self, aprilMsg):
 
         if not self.use_april:
@@ -228,27 +218,13 @@ class Planning_MPC():
 
         cur_X = np.array([x, y, v, psi])
         self.lead_car_state_buffer.writeFromNonRT(State(cur_X, cur_t))
-
+        # rospy.loginfo("Leading car pose: " + str(cur_X))
         if self.lead_car_center_line is None:
-            self.lead_car_center_line = np.array([[cur_X[0], cur_X[1]]]).T
+            self.lead_car_center_line = np.array([[cur_X[0], cur_X[1], cur_X[3]]]).T
+            # self.lead_car_headings = np.array([cur_X[3]]) 
         else:
-            self.lead_car_center_line = np.append(self.lead_car_center_line, np.array([[cur_X[0], cur_X[1]]]).T, axis=1) # append most recent x and y
-                
-        if self.lead_car_center_line.shape[1] > self.N + 17:
-            # create nominal trajectory not counting last 10 to keep following vehicle behind (max len of nominal traj is 300)
-            # if self.lead_car_center_line.shape[1] > 345:
-            #     nominal_traj = self.lead_car_center_line[:, -300:-30]
-            # else:
-            #     nominal_traj = self.lead_car_center_line[:,:-30]
-            
-            nominal_traj = self.lead_car_center_line[:, -15-self.N:-15]
-            #nominal_traj += np.random.rand(nominal_traj.shape)
-            self.lead_car_traj_raw = nominal_traj
-
-            # self.lead_car_traj = Track(center_line=nominal_traj,
-            #                     width_left=self.params['track_width_L'],
-            #                     width_right=self.params['track_width_R'],
-            #                     loop=True)
+            self.lead_car_center_line = np.append(self.lead_car_center_line, np.array([[cur_X[0], cur_X[1], cur_X[3]]]).T, axis=1) # append most recent x and y
+            # self.lead_car_headings = np.append(self.lead_car_headings, [cur_X[3]], axis=0)
 
     def odom_sub_callback(self, odomMsg):
         """
@@ -284,49 +260,39 @@ class Planning_MPC():
         cur_X = np.array([x, y, v, psi])
         # rospy.loginfo(cur_X)
 
+
         if self.following_car_center_line is None:
             self.following_car_center_line = np.array([[cur_X[0], cur_X[1], cur_X[3]]]).T
         else:
             self.following_car_center_line = np.append(self.following_car_center_line, np.array([[cur_X[0], cur_X[1], cur_X[3]]]).T, axis=1) # append most recent x, y, psi
 
-        last_plan = self.plan_buffer.readFromRT()
-        if last_plan is not None:
-            # get the control policy
-            X_k, u_k, K_k = last_plan.get_policy(cur_t)
-            u = u_k+ K_k@(cur_X - X_k)        
 
-            lead_car_state = self.lead_car_state_buffer.readFromRT()
+        self.ocp_solver.set_ref_path(self.lead_car_center_line)
+        sol_u, target_idx = self.ocp_solver.solve(cur_X)
 
+        # rospy.loginfo(sol_u[1])
 
-            rospy.loginfo("distance: " + str(np.linalg.norm(lead_car_state.state[:2] - cur_X[:2])))
-            rospy.loginfo("velocity: " + str(lead_car_state.state[2]))
-            rospy.loginfo("----")
+        steer_angle = self.normalize_angle(cur_X[3] + sol_u[1])
 
-            if lead_car_state.state[2] <= 0.05 and np.linalg.norm(lead_car_state.state[:2] - cur_X[:2]) <= .75:
-                rospy.loginfo("TOO CLOSE")
-                control = RCControl()
-                if self.stopping is False:
-                    control.throttle = -1
-                else:
-                    control.throttle = 0
-                self.stopping = True
-                control.steer = 0
-                control.reverse = False
-                self.control_pub.publish(control)
-                return
-            
-            self.stopping = False
-            # rospy.loginfo("publishing control")   
-            self.publish_control(v, u, cur_t)
+        # rospy.loginfo(steer_angle)
 
-            self.i += 1
-            plt.figure()
-            plt.scatter(self.lead_car_center_line[0,:], self.lead_car_center_line[1,:], color='orange')
-            plt.scatter(self.following_car_center_line[0,:], self.following_car_center_line[1,:], color= 'blue')
-            plt.plot(last_plan.nominal_x[0,:], last_plan.nominal_x[1,:], color='green')
-            plt.savefig('ilqr/test' + str(self.i))
-            plt.close()
-            
+        lead_car_line = self.ocp_solver.ref_path
+
+        plt.figure()
+        plt.scatter(lead_car_line[0,:], lead_car_line[1,:], color='orange')
+        plt.arrow(lead_car_line[0, target_idx], lead_car_line[1, target_idx], np.cos(lead_car_line[2, target_idx]), np.sin(lead_car_line[2, target_idx]), color='black')
+        plt.scatter(self.following_car_center_line[0,:], self.following_car_center_line[1,:], color= 'blue')
+        plt.arrow(cur_X[0], cur_X[1], np.cos(cur_X[3]), np.sin(cur_X[3]), color = 'blue')
+        plt.arrow(cur_X[0], cur_X[1], np.cos(steer_angle), np.sin(steer_angle), color= 'green')
+        plt.savefig('stanley/test' + str(self.i))
+
+        self.i += 1
+        # if v < .3:
+        #     a = .2
+        # else: 
+        #     a = 0
+        self.publish_control(v, [sol_u[0], sol_u[1]], cur_t)
+        
         # write the new pose to the buffer
         self.state_buffer.writeFromNonRT(State(cur_X, cur_t))
 
@@ -353,42 +319,12 @@ class Planning_MPC():
             d = temp@self.d_open_loop
             d = d+min(delta*delta*0.5,0.05)
 
-        control.throttle = np.clip(d, -1.0, 1.0)
+        control.throttle = np.clip(d, -1.0, 0.1)
         # control.steer = np.clip(delta/.3, -.8, .8)
         control.steer = np.clip(delta/.3, -1.0, 1.0)
         control.reverse = False
         # rospy.loginfo("a: " + str(a) + " throttle: " + str(control.throttle))
         self.control_pub.publish(control)
-
-    def ilqr_pub_thread(self):
-        time.sleep(5)
-        rospy.loginfo("iLQR Planning publishing thread started")
-        while not rospy.is_shutdown():
-            # determine if we need to publish
-            
-            cur_state = self.state_buffer.readFromRT()
-            prev_plan = self.plan_buffer.readFromRT()
-            if cur_state is None:
-                continue
-            since_last_pub = self.replan_dt if prev_plan is None else (
-                cur_state.t - prev_plan.t0).to_sec()
-            if since_last_pub >= self.replan_dt:
-                if prev_plan is None:
-                    u_init = None
-                else:
-                    u_init = np.zeros((2, self.N))
-                    u_init[:, :-1] = prev_plan.nominal_u[:, 1:]
-
-                if self.lead_car_traj_raw is None:
-                    continue
-                
-                sol_x, sol_u, _, _, _, sol_K, _, _ = self.ocp_solver.solve(
-                    cur_state.state, controls=u_init, ref_path=self.lead_car_traj_raw, record=True, obs_list=[])
-                # print(np.round(sol_x,2))
-                # print(np.round(sol_u[1,:],2))
-                cur_plan = Plan(sol_x, sol_u, sol_K, cur_state.t, self.replan_dt, self.N)
-                self.plan_buffer.writeFromNonRT(cur_plan)
-                
 
     def run(self):
         rospy.spin() 

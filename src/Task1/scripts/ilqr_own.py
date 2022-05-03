@@ -1,34 +1,46 @@
-from weakref import ref
 import numpy as np
-from .cost import Cost
-from .dynamics import Dynamics
 import time
-import rospy
 
+class ILQR_Own():
+    def __init__(self):
+        self.ref_path = None
+        self.pos_param = 5 
+        self.u_param = 5
 
-class iLQR():
+        self.diff = None
+    
+    def set_ref_path(self, ref_path):
+        path = ref_path[-50:]
+        sampled = path[1::5]
+        self.ref_path = sampled 
+    
+    def get_cost(self, X, U):
 
-    def __init__(self, ref_path=None, params=None):
+        sample_rate = len(X) / len(self.ref_path)
+        X_sampled = X[1::sample_rate]
+        X_sampled = X_sampled[:len(self.ref_path)]
 
-        self.T = params['T']
-        self.N = params['N']
+        pos_error = np.sum((X_sampled - self.ref_path)**2) 
+        u_error = np.sum(U**2)
 
-        self.ref_path = ref_path
+        cost = self.pos_param*pos_error + self.u_param*u_error
 
-        self.steps = params['max_itr']
+        return cost
 
-        self.tol = 1e-2
-        self.lambad = 10
-        self.lambad_max = 100
-        self.lambad_min = 1e-3
+    def get_derivatives(self, nominal_states, nominal_controls):
+        
 
-        self.dynamics = Dynamics(params)
-        self.alphas = 1.1**(-np.arange(10)**2)
+        q = 
+        Q = 
 
-        self.dim_x = self.dynamics.dim_x
-        self.dim_u = self.dynamics.dim_u
+        r = 2 * nominal_controls
+        R = 2 * np.eye(len(nominal_controls))
 
-        self.cost = Cost(params)
+        S = np.zeros((2,4))
+
+        return q, Q, r, R, S
+
+         
 
     def forward_pass(self, nominal_states, nominal_controls, K_closed_loop,
                      k_open_loop, alpha):
@@ -45,18 +57,15 @@ class iLQR():
             X[:, i + 1], U[:, i] = self.dynamics.forward_step(X[:, i], u)
         # print("forward pass integration use: ", time.time()-t0)
         
-        closest_pt, slope, theta = self.ref_path.get_closest_pts(X[:2, :])
         t1 = time.time()
-        J = self.cost.get_cost(X, U, closest_pt, slope, theta)
-        # print("get cost use: ", time.time()-t1)
-        # print("forward pass use: ", time.time()-t0)
-        return X, U, J, closest_pt, slope, theta
+        J = self.get_cost(X, U)
 
-    def backward_pass(self, nominal_states, nominal_controls, closest_pt,
-                      slope):
+        return X, U, J
+
+    def backward_pass(self, nominal_states, nominal_controls):
         # t0 = time.time()
-        L_x, L_xx, L_u, L_uu, L_ux = self.cost.get_derivatives(
-            nominal_states, nominal_controls, closest_pt, slope)
+        L_x, L_xx, L_u, L_uu, L_ux = self.get_derivatives(
+            nominal_states, nominal_controls)
         # print("backward pass derivative use: ", time.time()-t0)
         fx, fu = self.dynamics.get_AB_matrix(nominal_states, nominal_controls)
 
@@ -92,7 +101,7 @@ class iLQR():
 
         return K_closed_loop, k_open_loop
 
-    def solve(self, cur_state, ref_path=None, controls=None, obs_list=[], record=False):
+    def solve(self, cur_state, controls=None, obs_list=[], record=False):
         status = 0
         self.lambad = 10
 
@@ -107,23 +116,18 @@ class iLQR():
             states[:,
                    i], _ = self.dynamics.forward_step(states[:, i - 1],
                                                       controls[:, i - 1])
-        closest_pt, slope, theta = self.ref_path.get_closest_pts(states[:2, :])
 
-        self.cost.update_obs(obs_list)
-
-        self.cost.ref_path = ref_path
-
-        J = self.cost.get_cost(states, controls, closest_pt, slope, theta)
+        J = self.get_cost(states, controls)
 
         converged = False
 
         # have_not_updated = 0
         for i in range(self.steps):
             K_closed_loop, k_open_loop = self.backward_pass(
-                states, controls, closest_pt, slope)
+                states, controls)
             updated = False
             for alpha in self.alphas:
-                X_new, U_new, J_new, closest_pt_new, slope_new, theta_new = (
+                X_new, U_new, J_new = (
                     self.forward_pass(states, controls, K_closed_loop,
                                       k_open_loop, alpha))
                 if J_new <= J:
@@ -132,9 +136,6 @@ class iLQR():
                     J = J_new
                     states = X_new
                     controls = U_new
-                    closest_pt = closest_pt_new
-                    slope = slope_new
-                    theta = theta_new
                     updated = True
                     break
             if updated:
@@ -153,11 +154,10 @@ class iLQR():
 
         if record:
             # get parameters for FRS
-            K_closed_loop, _ = self.backward_pass(states, controls, closest_pt,
-                                                  slope)
+            K_closed_loop, _ = self.backward_pass(states, controls)
             fx, fu = self.dynamics.get_AB_matrix(states, controls)
         else:
             K_closed_loop = None
             fx = None
             fu = None
-        return states, controls, t_process, status, theta, K_closed_loop, fx, fu
+        return states, controls, t_process, status, K_closed_loop, fx, fu

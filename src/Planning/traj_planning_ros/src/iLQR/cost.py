@@ -32,6 +32,11 @@ class Cost:
     self.zeros = np.zeros((self.N))
     self.ones = np.ones((self.N))
 
+    self.dist = None
+    self.ref_path = None
+    self.path_weight = 5
+    self.control_weight = 1
+
   #* New stuff.
   def update_obs(self, frs_list):
     self.soft_constraints.update_obs(frs_list)
@@ -52,42 +57,49 @@ class Cost:
     Returns:
         np.ndarray: costs.
     """
+    assert self.ref_path is not None, "Ref path is None somehow."
+    path_cost = np.linalg.norm(states[:2,:] - self.ref_path)**2
+
+    control_cost = np.linalg.norm(controls)**2
+
+    J = self.path_weight * path_cost + self.control_weight * control_cost
+    # transform = np.array([[
+    #     np.sin(slope), -np.cos(slope), self.zeros, self.zeros
+    # ], [self.zeros, self.zeros, self.ones, self.zeros]])
+
+    # ref_states = np.zeros_like(states)
+    # ref_states[0, :] = closest_pt[0, :]+np.sin(slope) * self.track_offset
+    # ref_states[1, :] = closest_pt[1, :]-np.cos(slope) * self.track_offset
+    # ref_states[2, :] = self.v_max
+
+    # error = states - ref_states 
+    # Q_trans = np.einsum(
+    #     'abn, bcn->acn',
+    #     np.einsum(
+    #         'dan, ab -> dbn', transform.transpose(1, 0, 2), self.W_state
+    #     ), transform
+    # )
+
+    # c_state = np.einsum(
+    #     'an, an->n', error, np.einsum('abn, bn->an', Q_trans, error)
+    # )
+    # self.dist = theta
     
-    transform = np.array([[
-        np.sin(slope), -np.cos(slope), self.zeros, self.zeros
-    ], [self.zeros, self.zeros, self.ones, self.zeros]])
+    # c_progress = -self.w_theta * np.sum((theta**2))  #(theta[-1] - theta[0])
 
-    ref_states = np.zeros_like(states)
-    ref_states[0, :] = closest_pt[0, :]+np.sin(slope) * self.track_offset
-    ref_states[1, :] = closest_pt[1, :]-np.cos(slope) * self.track_offset
-    ref_states[2, :] = self.v_max
+    # c_control = np.einsum(
+    #     'an, an->n', controls,
+    #     np.einsum('ab, bn->an', self.W_control, controls)
+    # )
 
-    error = states - ref_states 
-    Q_trans = np.einsum(
-        'abn, bcn->acn',
-        np.einsum(
-            'dan, ab -> dbn', transform.transpose(1, 0, 2), self.W_state
-        ), transform
-    )
-
-    c_state = np.einsum(
-        'an, an->n', error, np.einsum('abn, bn->an', Q_trans, error)
-    )
-    c_progress = -self.w_theta * np.sum(theta)  #(theta[-1] - theta[0])
-
-    c_control = np.einsum(
-        'an, an->n', controls,
-        np.einsum('ab, bn->an', self.W_control, controls)
-    )
-
-    c_control[-1] = 0
+    # c_control[-1] = 0
     
-    # constraints
-    c_constraint = self.soft_constraints.get_cost(
-        states, controls, closest_pt, slope
-    )    
+    # # constraints
+    # c_constraint = self.soft_constraints.get_cost(
+    #     states, controls, closest_pt, slope
+    # )    
 
-    J = np.sum(c_state + c_constraint + c_control) + c_progress
+    # J = np.sum(c_state + c_constraint + c_control) + c_progress
 
     return J
 
@@ -99,19 +111,37 @@ class Cost:
         closest_pt: 2xN array of each state's closest point [x,y] on the track
         slope: 1xN array of track's slopes (rad) at closest points
     '''
-    c_x_cons, c_xx_cons, c_u_cons, c_uu_cons, c_ux_cons = (
-        self.soft_constraints.get_derivatives(
-            states, controls, closest_pt, slope
-        )
-    )
+    # c_x_cons, c_xx_cons, c_u_cons, c_uu_cons, c_ux_cons = (
+    #     self.soft_constraints.get_derivatives(
+    #         states, controls, closest_pt, slope
+    #     )
+    # )
+    c_x_cons = 0
+    c_xx_cons = 0
+    c_u_cons = 0
+    c_uu_cons = 0
+    c_ux_cons = np.zeros((2,4,11))
 
-    c_x_cost, c_xx_cost = self._get_cost_state_derivative(
-        states, closest_pt, slope
-    )
+    # c_x_cost, c_xx_cost = self._get_cost_state_derivative(
+    #     states, closest_pt, slope
+    # )
+    delta_path = states[:2,:] - self.ref_path
 
-    c_u_cost, c_uu_cost = self._get_cost_control_derivative(controls)
+    c_x_cost = 2 * delta_path
+
+    xx_hes = np.block([[np.eye(delta_path.shape[0]), np.zeros((2,2))], [np.zeros((2,2)), np.zeros((2,2))]])
+
+    c_xx_cost = 2 * np.repeat(xx_hes[:, :, np.newaxis], delta_path.shape[1], axis=2)
+    #c_u_cost, c_uu_cost = self._get_cost_control_derivative(controls)
+    c_u_cost = 2 * controls
+    c_uu_cost = 2 * np.repeat(np.eye(controls.shape[0])[:, :, np.newaxis], controls.shape[1], axis=2)
+
+
+    ZEROS = np.zeros(delta_path.shape)
 
     q = c_x_cons + c_x_cost
+    q = np.vstack((q, ZEROS))
+
     Q = c_xx_cons + c_xx_cost
 
     r = c_u_cost + c_u_cons
@@ -147,9 +177,11 @@ class Cost:
     # shape [4xN]
     c_x = 2 * np.einsum('abn, bn->an', Q_trans, error)
 
-    c_x_progress = -self.w_theta * np.array([
-        np.cos(slope), np.sin(slope), self.zeros, self.zeros
-    ])
+    # c_x_progress = -self.w_theta * np.array([
+    #     np.cos(slope), np.sin(slope), self.zeros, self.zeros
+    # ])
+    c_x_progress = -self.w_theta * np.array([self.dist[0,:], self.dist[1,:], self.zeros, self.zeros])
+
     c_x = c_x + c_x_progress
     c_xx = 2 * Q_trans
 

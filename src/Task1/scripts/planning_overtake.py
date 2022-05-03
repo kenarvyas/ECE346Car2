@@ -18,6 +18,7 @@ from rc_control_msgs.msg import RCControl
 import yaml, csv
 import time
 import matplotlib.pyplot as plt
+from overtaker import Overtaker
 
 controller = "ilqr_old" # "ilqr_new, ilqr_old, or stanley"
 
@@ -51,7 +52,7 @@ class Plan():
         return x_k, u_k, K_k
 
         
-class Planning_MPC():
+class Planning_MPC_Overtake():
 
     def __init__(self,
                 track_file=None,
@@ -99,8 +100,10 @@ class Planning_MPC():
 
         self.state_buffer = RealtimeBuffer()
         self.plan_buffer = RealtimeBuffer()
-        self.lead_car_state_buffer = RealtimeBuffer()
+        self.lead_car_state_buffer_true = RealtimeBuffer()
+        self.lead_car_state_buffer_april = RealtimeBuffer()
         self.lead_car_center_line = None
+        self.lead_car_center_line_true = None
         self.following_car_center_line = None
         self.lead_car_traj = None
         self.lead_car_traj_raw = None
@@ -115,7 +118,7 @@ class Planning_MPC():
                                         self.odom_sub_callback,
                                         queue_size=1)
         
-        april_tag_topic = '/tag_detections'
+        april_tag_topic = '/nx4/tag_detections'
         self.april_tag_sub = rospy.Subscriber(april_tag_topic, AprilTagDetectionArray, self.april_tag_sub_callback, queue_size=1)
 
         self.lead_car_pose_sub = rospy.Subscriber(lead_car_pose_topic,
@@ -125,34 +128,39 @@ class Planning_MPC():
         self.use_april = False
 
         self.stopping = False
+
+        self.overtaker = Overtaker()
     
         # start planning thread
         threading.Thread(target=self.ilqr_pub_thread).start()
+    
     def april_tag_sub_callback(self, aprilMsg):
-
+        
         if not self.use_april:
             return
 
         cur_t = aprilMsg.header.stamp
         detections = aprilMsg.detections 
-
+        
         if len(detections) == 0:
             rospy.loginfo("LOST DETECTION")
             return
+        #else:
+            #rospy.loginfo("Num detections: " + str(len(detections)))
 
         detection_idx = 0
         for i, detection in enumerate(detections):
-            if detection.id[0] == 573:
+            if detection.id[0] == 500:
                 detection_idx = i
         
         detection = detections[detection_idx]
 
-        rel_x = detection.pose.pose.position.x
-        rel_y = detection.pose.pose.position.y
+        rel_x = detection.pose.pose.pose.position.x
+        rel_y = detection.pose.pose.pose.position.y
 
         r = Rotation.from_quat([
-            aprilMsg.pose.pose.orientation.x, aprilMsg.pose.pose.orientation.y,
-            aprilMsg.pose.pose.orientation.z, aprilMsg.pose.pose.orientation.w
+            detection.pose.pose.pose.orientation.x, detection.pose.pose.pose.orientation.y,
+            detection.pose.pose.pose.orientation.z, detection.pose.pose.pose.orientation.w
         ])
 
         rot_vec = r.as_rotvec()
@@ -173,7 +181,7 @@ class Planning_MPC():
 
 
         # get previous state
-        prev_state = self.lead_car_state_buffer.readFromRT()
+        prev_state = self.lead_car_state_buffer_april.readFromRT()
 
         # linear velocity
         if prev_state is not None:
@@ -185,18 +193,25 @@ class Planning_MPC():
             v = 0
 
         cur_X = np.array([x, y, v, psi])
-        self.lead_car_state_buffer.writeFromNonRT(State(cur_X, cur_t))
+        rospy.loginfo("Lead car state (april): " + str(cur_X))
+        self.lead_car_state_buffer_april.writeFromNonRT(State(cur_X, cur_t))
         # rospy.loginfo("Leading car pose: " + str(cur_X))
         if self.lead_car_center_line is None:
-            self.lead_car_center_line = np.array([[cur_X[0], cur_X[1], cur_X[3]]]).T
+            self.lead_car_center_line = np.array([[cur_X[0], cur_X[1]]]).T
         else:
-            self.lead_car_center_line = np.append(self.lead_car_center_line, np.array([[cur_X[0], cur_X[1], cur_X[3]]]).T, axis=1) # append most recent x and y
+            self.lead_car_center_line = np.append(self.lead_car_center_line, np.array([[cur_X[0], cur_X[1]]]).T, axis=1) # append most recent x and y
+
+        if self.lead_car_center_line.shape[1] > self.N + 17:
+            rospy.loginfo("Following")
+            nominal_traj = self.lead_car_center_line[:, -10-self.N:-10]
+            self.lead_car_traj_raw = nominal_traj
         
 
     def lead_car_odom_sub_callback(self, odomMsg):
         """
         Subscriber callback function of the lead robot pose
         """
+    
         if self.use_april:
             return
         cur_t = odomMsg.header.stamp
@@ -215,7 +230,7 @@ class Planning_MPC():
         psi = rot_vec[2]
         
         # get previous state
-        prev_state = self.lead_car_state_buffer.readFromRT()
+        prev_state = self.lead_car_state_buffer_true.readFromRT()
 
         # linear velocity
         if prev_state is not None:
@@ -227,21 +242,40 @@ class Planning_MPC():
             v = 0
 
         cur_X = np.array([x, y, v, psi])
-        self.lead_car_state_buffer.writeFromNonRT(State(cur_X, cur_t))
+        rospy.loginfo("Lead car state (true): " + str(cur_X))
+        self.lead_car_state_buffer_true.writeFromNonRT(State(cur_X, cur_t))
+        
+
+        # if self.lead_car_center_line_true is None:
+        #     self.lead_car_center_line_true = np.array([[cur_X[0], cur_X[1]]]).T
+        # else:
+        #     self.lead_car_center_line_true = np.append(self.lead_car_center_line_true, np.array([[cur_X[0], cur_X[1]]]).T, axis=1)
+        # return
 
         if self.lead_car_center_line is None:
             self.lead_car_center_line = np.array([[cur_X[0], cur_X[1]]]).T
         else:
             self.lead_car_center_line = np.append(self.lead_car_center_line, np.array([[cur_X[0], cur_X[1]]]).T, axis=1) # append most recent x and y
                 
-        if self.lead_car_center_line.shape[1] > self.N + 17:
+        # rospy.loginfo(self.lead_car_center_line.shape)
+
+        followcar_state = self.state_buffer.readFromRT()
+        if followcar_state is None:
+            return
+        overtake_state = self.overtaker.pass_car(followcar_state.state, cur_X)
+        if overtake_state is not None:
+            rospy.loginfo("OVERTAKE IN PROGRESS")
+            nominal_traj = np.repeat(overtake_state[:2, np.newaxis], self.N, axis=1)
+            self.lead_car_traj_raw = nominal_traj
+        elif self.lead_car_center_line.shape[1] > self.N + 17:
+            rospy.loginfo("Following")
             # create nominal trajectory not counting last 10 to keep following vehicle behind (max len of nominal traj is 300)
             # if self.lead_car_center_line.shape[1] > 345:
             #     nominal_traj = self.lead_car_center_line[:, -300:-30]
             # else:
             #     nominal_traj = self.lead_car_center_line[:,:-30]
             
-            nominal_traj = self.lead_car_center_line[:, -15-self.N:-15]
+            nominal_traj = self.lead_car_center_line[:, -10-self.N:-10]
             #nominal_traj += np.random.rand(nominal_traj.shape)
             self.lead_car_traj_raw = nominal_traj
 
@@ -295,37 +329,42 @@ class Planning_MPC():
             X_k, u_k, K_k = last_plan.get_policy(cur_t)
             u = u_k+ K_k@(cur_X - X_k)        
 
-            lead_car_state = self.lead_car_state_buffer.readFromRT()
+            # if self.use_april:
+            #     lead_car_state = self.lead_car_state_buffer_april.readFromRT()
+            # else:
+            #     lead_car_state = self.lead_car_state_buffer_true.readFromRT()
+           
 
 
-            rospy.loginfo("distance: " + str(np.linalg.norm(lead_car_state.state[:2] - cur_X[:2])))
-            rospy.loginfo("velocity: " + str(lead_car_state.state[2]))
-            rospy.loginfo("----")
+            # rospy.loginfo("distance: " + str(np.linalg.norm(lead_car_state.state[:2] - cur_X[:2])))
+            # rospy.loginfo("velocity: " + str(lead_car_state.state[2]))
+            # rospy.loginfo("----")
 
-            if lead_car_state.state[2] <= 0.05 and np.linalg.norm(lead_car_state.state[:2] - cur_X[:2]) <= .75:
-                rospy.loginfo("TOO CLOSE")
-                control = RCControl()
-                if self.stopping is False:
-                    control.throttle = -1
-                else:
-                    control.throttle = 0
-                self.stopping = True
-                control.steer = 0
-                control.reverse = False
-                self.control_pub.publish(control)
-                return
+            # if lead_car_state.state[2] <= 0.05 and np.linalg.norm(lead_car_state.state[:2] - cur_X[:2]) <= .5:
+            #     rospy.loginfo("TOO CLOSE")
+            #     control = RCControl()
+            #     if self.stopping is False:
+            #         control.throttle = -1
+            #     else:
+            #         control.throttle = 0
+            #     self.stopping = True
+            #     control.steer = 0
+            #     control.reverse = False
+            #     self.control_pub.publish(control)
+            #     return
             
             self.stopping = False
-            # rospy.loginfo("publishing control")   
+            rospy.loginfo("publishing control")   
             self.publish_control(v, u, cur_t)
 
             self.i += 1
-            plt.figure()
-            plt.scatter(self.lead_car_center_line[0,:], self.lead_car_center_line[1,:], color='orange')
-            plt.scatter(self.following_car_center_line[0,:], self.following_car_center_line[1,:], color= 'blue')
-            plt.plot(last_plan.nominal_x[0,:], last_plan.nominal_x[1,:], color='green')
-            plt.savefig('ilqr/test' + str(self.i))
-            plt.close()
+            # plt.figure()
+            # plt.scatter(self.lead_car_center_line[0,:], self.lead_car_center_line[1,:], color='orange')
+            # plt.scatter(self.following_car_center_line[0,:], self.following_car_center_line[1,:], color= 'blue')
+            # plt.scatter(self.lead_car_center_line_true[0,:], self.lead_car_center_line_true[1,:], color='red')
+            # plt.plot(last_plan.nominal_x[0,:], last_plan.nominal_x[1,:], color='green')
+            # plt.savefig('ilqr/test' + str(self.i))
+            # plt.close()
             
         # write the new pose to the buffer
         self.state_buffer.writeFromNonRT(State(cur_X, cur_t))
@@ -381,7 +420,7 @@ class Planning_MPC():
 
                 if self.lead_car_traj_raw is None:
                     continue
-                
+                rospy.loginfo(str(self.lead_car_traj_raw))
                 sol_x, sol_u, _, _, _, sol_K, _, _ = self.ocp_solver.solve(
                     cur_state.state, controls=u_init, ref_path=self.lead_car_traj_raw, record=True, obs_list=[])
                 # print(np.round(sol_x,2))

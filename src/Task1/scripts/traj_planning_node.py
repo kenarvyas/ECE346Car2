@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from planning_overtake import Planning_MPC_Overtake
 import rospy
 from std_msgs.msg import String
 from planning import Planning_MPC
@@ -15,12 +16,21 @@ def main():
     ParamsFile = rospy.get_param("~PlanParamsFile")
     TrackFile = rospy.get_param("~TrackFile")    
 
-    planner = Planning_MPC(track_file=TrackFile,
-                 pose_topic=PoseTopic,
-                 lead_car_pose_topic=LeadCarPoseTopic,
-                 control_topic=ControllerTopic,
-                 params_file=ParamsFile)
-    planner.run()
+    overtake = False
+    if overtake:
+        planner = Planning_MPC_Overtake(track_file=TrackFile,
+                    pose_topic=PoseTopic,
+                    lead_car_pose_topic=LeadCarPoseTopic,
+                    control_topic=ControllerTopic,
+                    params_file=ParamsFile)
+        planner.run()
+    else:
+        planner = Planning_MPC(track_file=TrackFile,
+                    pose_topic=PoseTopic,
+                    lead_car_pose_topic=LeadCarPoseTopic,
+                    control_topic=ControllerTopic,
+                    params_file=ParamsFile)
+        planner.run()      
 
 
 if __name__ == '__main__':
